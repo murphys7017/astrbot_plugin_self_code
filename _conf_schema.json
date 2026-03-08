@@ -1,0 +1,26 @@
+{
+  "single_user_id": {
+    "type": "string",
+    "description": "Single Allowed User ID",
+    "hint": "Only this user id can use /dev commands. Empty means no restriction.",
+    "default": ""
+  },
+  "codex_timeout": {
+    "type": "int",
+    "description": "Codex Timeout Seconds",
+    "hint": "Timeout in seconds for `codex exec`.",
+    "default": 300
+  },
+  "auto_test_before_apply": {
+    "type": "bool",
+    "description": "Auto Test Before Apply",
+    "hint": "Run basic sandbox test automatically before /dev apply.",
+    "default": true
+  },
+  "dev_mode_timeout": {
+    "type": "int",
+    "description": "Dev Mode Timeout Seconds",
+    "hint": "How long session mode waits for next message before auto-stop.",
+    "default": 1800
+  }
+}
