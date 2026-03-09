@@ -79,6 +79,14 @@ AstrBot/data/plugin_data/astrbot_plugin_self_code/runtime/
 - `/codexdev skills show <skill_name>`
   - 查看本地 skill 内容预览
 
+LLM Tools（可供 Agent 调用）：
+- `codexdev_skills_status`
+- `codexdev_skills_update`
+- `codexdev_skills_list`
+- `codexdev_skills_show(skill_name)`
+- `codexdev_skills_suggest(requirement)`
+- `codexdev_skills_create(skill_name, requirement)`
+
 V1 兼容命令（在会话中或显式调用）：
 
 - `/codexdev ask <prompt>`
