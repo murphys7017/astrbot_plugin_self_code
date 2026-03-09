@@ -218,10 +218,14 @@ class SelfCodePlugin(Star):
             )
         except Exception as exc:  # pragma: no cover - runtime defensive path.
             logger.exception("Dev mode waiter failed: %s", exc)
-            if self.dev_session:
-                self.dev_session.active = False
-            self._terminate_dev_session()
-            return f"开发模式因错误退出：{exc}"
+            # Keep session active on runtime errors; only timeout/stop-confirm can exit.
+            if self.dev_session and self.dev_session.active:
+                return (
+                    f"开发模式处理异常：{exc}\n"
+                    f"会话仍保持激活。可继续发送消息，或执行 "
+                    f"`{COMMAND_PREFIX} stop confirm` 退出。"
+                )
+            return f"开发模式处理异常：{exc}"
         return None
 
     async def _handle_session_message(
@@ -244,7 +248,7 @@ class SelfCodePlugin(Star):
                 command,
                 argument,
             )
-            if command == "stop" or command == "abort":
+            if command == "stop":
                 if self._should_confirm_stop(argument):
                     self._terminate_dev_session()
                     controller.stop()
@@ -254,29 +258,30 @@ class SelfCodePlugin(Star):
                     "请确认退出开发模式：\n"
                     f"发送 `{COMMAND_PREFIX} stop confirm` 确认退出。"
                 )
+            if command == "abort":
+                return f"请使用 `{COMMAND_PREFIX} stop confirm` 退出开发模式。"
             if command == "status":
                 return self._status_text()
             try:
-                return await self._execute_v1_command(
+                reply = await self._execute_v1_command(
                     command=command, argument=argument
                 )
+                self._keep_dev_session_active()
+                return reply
             except Exception as exc:  # pragma: no cover - runtime defensive path.
                 logger.exception("Session command failed: %s", exc)
+                self._keep_dev_session_active()
                 return f"会话命令执行失败：{exc}"
 
         if self._is_natural_stop_intent(raw_message):
-            if self._should_confirm_stop(""):
-                self._terminate_dev_session()
-                controller.stop()
-                logger.info("Dev mode stopped by natural-language intent")
-                return "已退出开发模式。"
+            self.pending_stop_confirm_until = time.time() + 60
             return (
                 "检测到你想退出开发模式。\n"
                 f"请发送 `{COMMAND_PREFIX} stop confirm` 确认退出。"
             )
 
         try:
-            return await self.dev_session.handle_message(
+            reply = await self.dev_session.handle_message(
                 message=raw_message,
                 workspace_manager=self.workspace_manager,
                 tester=self.tester,
@@ -287,8 +292,11 @@ class SelfCodePlugin(Star):
                 ),
                 auto_test_before_apply=self._cfg_bool("auto_test_before_apply", True),
             )
+            self._keep_dev_session_active()
+            return reply
         except Exception as exc:  # pragma: no cover - runtime defensive path.
             logger.exception("Dev session message handling failed: %s", exc)
+            self._keep_dev_session_active()
             return f"开发会话处理失败：{exc}"
 
     async def _execute_v1_command(self, command: str, argument: str) -> str:
@@ -297,7 +305,7 @@ class SelfCodePlugin(Star):
         if command == "inspect":
             command = "files"
         if command == "abort":
-            command = "stop"
+            return f"请使用 `{COMMAND_PREFIX} stop confirm` 退出开发模式。"
 
         if command == "status":
             return self._status_text()
@@ -484,6 +492,11 @@ class SelfCodePlugin(Star):
         self.dev_session = None
         self.pending_stop_confirm_until = None
 
+    def _keep_dev_session_active(self) -> None:
+        """Force session to remain active after non-exit task handling."""
+        if self.dev_session is not None:
+            self.dev_session.active = True
+
     def _status_text(self) -> str:
         """Return current dev session status text."""
         if not self.dev_session or not self.dev_session.active:
@@ -540,12 +553,9 @@ class SelfCodePlugin(Star):
 
     def _should_confirm_stop(self, argument: str) -> bool:
         """Handle two-step stop confirmation with a short validity window."""
-        now = time.time()
-        confirm_tokens = {"confirm", "确认", "yes", "y"}
-        if argument.strip().lower() in confirm_tokens:
-            # Explicit confirmation should always succeed to avoid confirmation loops.
+        if argument.strip().lower() == "confirm":
             return True
-        self.pending_stop_confirm_until = now + 60
+        self.pending_stop_confirm_until = time.time() + 60
         return False
 
     def _extract_explicit_command(self, message_text: str) -> tuple[bool, str, str]:

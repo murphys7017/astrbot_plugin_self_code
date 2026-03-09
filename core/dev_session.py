@@ -360,6 +360,12 @@ class DevSession:
                 codex_timeout=codex_timeout,
                 codex_bin=codex_bin,
             )
+        skill_first_reply = self._maybe_start_skill_first_flow(
+            text=text,
+            local_skills_manager=local_skills_manager,
+        )
+        if skill_first_reply is not None:
+            return skill_first_reply
 
         project_tree = (
             "\n".join(workspace_manager.list_files(self.plugin_name)) or "(empty)"
@@ -583,7 +589,9 @@ class DevSession:
         return (
             "你要新增 skill，但我还缺少功能描述。\n"
             "请告诉我这个 skill 具体做什么（输入、步骤、期望输出）。\n"
-            "我会先给出计划，等你确认后再创建并自动重载。"
+            "我会先给出计划，等你确认后再创建并自动重载。\n"
+            "你也可以用命令：`/codexdev skills suggest <需求>` 或 "
+            "`/codexdev skills create <skill_name> <需求>`。"
         )
 
     def _build_skill_plan_from_intake(
@@ -705,6 +713,69 @@ class DevSession:
             "benefit": "减少重复提示词，固化高频任务步骤",
             "draft_summary": "Purpose + Trigger examples + Workflow + Constraints + Output requirements",
         }
+
+    def _maybe_start_skill_first_flow(
+        self,
+        text: str,
+        local_skills_manager: LocalSkillsManager,
+    ) -> str | None:
+        """Start skill creation plan automatically for obvious skill-like requests."""
+        if self.pending_skill_intake or self.pending_skill_plan is not None:
+            return None
+        if not self._is_obvious_skill_case(text):
+            return None
+        if self._requires_plugin_source_change(text):
+            return None
+
+        requirement = text.strip()
+        if len(requirement) < 4:
+            return None
+        skill_name = self._suggest_skill_name_from_text(requirement)
+        plan = local_skills_manager.build_plan_from_requirement(
+            skill_name=skill_name,
+            requirement=requirement,
+        )
+        self.pending_skill_intake = False
+        self.pending_skill_plan = plan
+        self.pending_skill_suggestion = None
+        return (
+            "检测到该需求属于可复用对话规则，按 skill-first 策略优先创建 local skill。\n\n"
+            f"{local_skills_manager.render_plan_card(plan)}\n\n"
+            "提示：优先使用 `/codexdev skills suggest <需求>` 或 "
+            "`/codexdev skills create <skill_name> <需求>`。"
+        )
+
+    def _is_obvious_skill_case(self, text: str) -> bool:
+        """Heuristic detector for requests that should be implemented as skills."""
+        lowered = text.lower()
+        patterns = (
+            r"(用户|user).{0,16}(说|says?|输入|send).{0,24}(回复|reply|返回|respond)",
+            r"(触发词|关键词|trigger).{0,20}(回复|reply|返回|respond)",
+            r"(固定回复|固定回答|simple conversation|简单对话|greeting|问候)",
+            r"(可复用|reusable).{0,20}(行为|流程|pattern|interaction)",
+        )
+        return any(re.search(pattern, lowered) for pattern in patterns)
+
+    def _requires_plugin_source_change(self, text: str) -> bool:
+        """Return whether request likely requires direct plugin code changes."""
+        lowered = text.lower()
+        keywords = (
+            "新增命令",
+            "新命令",
+            "slash command",
+            "api",
+            "http",
+            "webhook",
+            "数据库",
+            "database",
+            "定时任务",
+            "scheduler",
+            "中间件",
+            "事件钩子",
+            "main.py",
+            "插件源码",
+        )
+        return any(keyword in lowered for keyword in keywords)
 
     def _suggest_skill_name_from_text(self, text: str) -> str:
         lowered = text.lower()
