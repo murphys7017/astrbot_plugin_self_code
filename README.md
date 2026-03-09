@@ -27,6 +27,7 @@ astrbot_plugin_self_code/
 ├── core/
 │   ├── codex_runner.py
 │   ├── dev_session.py
+│   ├── llm_tools.py
 │   ├── local_skills.py
 │   ├── prompt_builder.py
 │   ├── skills_cache.py
@@ -80,12 +81,21 @@ AstrBot/data/plugin_data/astrbot_plugin_self_code/runtime/
   - 查看本地 skill 内容预览
 
 LLM Tools（可供 Agent 调用）：
-- `codexdev_skills_status`
-- `codexdev_skills_update`
-- `codexdev_skills_list`
-- `codexdev_skills_show(skill_name)`
-- `codexdev_skills_suggest(requirement)`
-- `codexdev_skills_create(skill_name, requirement)`
+（采用 `FunctionTool` + `context.add_llm_tools(...)` 注册）
+- 说明：旧 `codexdev_*` tool 名称已移除，请改用以下 `selfcode_*` 名称。
+- `selfcode_skill_cache_status`
+- `selfcode_skill_cache_update`
+- `selfcode_skill_list`
+- `selfcode_skill_show(skill_name)`
+- `selfcode_skill_suggest(requirement)`
+- `selfcode_skill_create(skill_name, requirement)`
+- `selfcode_dev_start(plugin_name)`
+- `selfcode_dev_resume(plugin_name)`
+- `selfcode_dev_status`
+- `selfcode_dev_chat(message)`
+- `selfcode_dev_test`
+- `selfcode_dev_apply`
+- `selfcode_dev_stop(confirm)`
 
 V1 兼容命令（在会话中或显式调用）：
 

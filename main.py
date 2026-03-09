@@ -13,6 +13,7 @@ from astrbot.api.util import SessionController, session_waiter
 
 from .core.codex_runner import run_codex
 from .core.dev_session import DevSession
+from .core.llm_tools import build_selfcode_tools
 from .core.local_skills import LocalSkillsManager
 from .core.skills_cache import SkillsCacheManager
 from .core.tester import Tester
@@ -44,6 +45,13 @@ class SelfCodePlugin(Star):
         self.dev_session: DevSession | None = None
         self.last_plugin_name: str | None = None
         self.pending_stop_confirm_until: float | None = None
+        self._register_llm_tools_dataclass()
+
+    def _register_llm_tools_dataclass(self) -> None:
+        """Register FunctionTool-based LLM tools via AstrBot unified API."""
+        tools = build_selfcode_tools(self)
+        self.context.add_llm_tools(*tools)
+        logger.info("Registered %s selfcode FunctionTools.", len(tools))
 
     async def initialize(self) -> None:
         """Prepare runtime directories during plugin startup."""
@@ -166,121 +174,6 @@ class SelfCodePlugin(Star):
                 response, in_dev_mode=bool(self.dev_session and self.dev_session.active)
             )
         )
-
-    @filter.llm_tool(name="codexdev_skills_status")
-    async def tool_skills_status(self, event: AstrMessageEvent):
-        """查询 skills 缓存状态。
-
-        Args:
-            none(string): 固定填 "none" 即可
-        """
-        denied = self._check_single_user_permission(event)
-        if denied:
-            yield event.plain_result(denied)
-            return
-        yield event.plain_result(self.skills_cache.render_status_text())
-
-    @filter.llm_tool(name="codexdev_skills_update")
-    async def tool_skills_update(self, event: AstrMessageEvent):
-        """手动刷新 AstrBot-Skill 缓存快照。
-
-        Args:
-            none(string): 固定填 "none" 即可
-        """
-        denied = self._check_single_user_permission(event)
-        if denied:
-            yield event.plain_result(denied)
-            return
-        result = await asyncio.to_thread(self.skills_cache.update_from_remote)
-        status_text = self.skills_cache.render_status_text()
-        if result.get("success"):
-            yield event.plain_result(
-                f"{result.get('message', 'Skills cache updated.')}\n\n{status_text}"
-            )
-            return
-        yield event.plain_result(
-            f"{result.get('message', 'Skills cache update failed.')}\n\n{status_text}"
-        )
-
-    @filter.llm_tool(name="codexdev_skills_list")
-    async def tool_skills_list(self, event: AstrMessageEvent):
-        """列出本地已注册 skills 名称。
-
-        Args:
-            none(string): 固定填 "none" 即可
-        """
-        denied = self._check_single_user_permission(event)
-        if denied:
-            yield event.plain_result(denied)
-            return
-        names = self.local_skills.list_skills()
-        if not names:
-            yield event.plain_result("暂无本地 skills。")
-            return
-        yield event.plain_result("本地 skills:\n" + "\n".join(f"- {item}" for item in names))
-
-    @filter.llm_tool(name="codexdev_skills_show")
-    async def tool_skills_show(self, event: AstrMessageEvent, skill_name: str):
-        """查看本地 skill 内容预览。
-
-        Args:
-            skill_name(string): 需要查看的 skill 名称
-        """
-        denied = self._check_single_user_permission(event)
-        if denied:
-            yield event.plain_result(denied)
-            return
-        try:
-            content = self.local_skills.show_skill(skill_name)
-        except Exception as exc:
-            yield event.plain_result(f"读取 skill 失败：{exc}")
-            return
-        preview = "\n".join(content.splitlines()[:80])
-        yield event.plain_result(f"`{skill_name}`:\n{preview}")
-
-    @filter.llm_tool(name="codexdev_skills_suggest")
-    async def tool_skills_suggest(self, event: AstrMessageEvent, requirement: str):
-        """根据需求生成可复用 skill 建议卡。
-
-        Args:
-            requirement(string): 你希望沉淀为 skill 的流程描述
-        """
-        denied = self._check_single_user_permission(event)
-        if denied:
-            yield event.plain_result(denied)
-            return
-        requirement_text = requirement.strip()
-        if not requirement_text:
-            yield event.plain_result(f"用法：{COMMAND_PREFIX} skills suggest <需求>")
-            return
-        suggestion = await self._suggest_skill(requirement_text)
-        if self.dev_session and self.dev_session.active:
-            self.dev_session.pending_skill_suggestion = suggestion
-        yield event.plain_result(self.local_skills.render_suggestion_card(suggestion))
-
-    @filter.llm_tool(name="codexdev_skills_create")
-    async def tool_skills_create(
-        self, event: AstrMessageEvent, skill_name: str, requirement: str
-    ):
-        """创建或更新本地 skill，并尝试自动重载本插件。
-
-        Args:
-            skill_name(string): skill 名称（建议短横线命名）
-            requirement(string): 功能需求描述
-        """
-        denied = self._check_single_user_permission(event)
-        if denied:
-            yield event.plain_result(denied)
-            return
-        skill = skill_name.strip()
-        req = requirement.strip()
-        if not skill or not req:
-            yield event.plain_result(
-                "参数不完整：需要 skill_name 和 requirement。"
-            )
-            return
-        result = await self._create_skill(skill_name=skill, requirement=req)
-        yield event.plain_result(result)
 
     async def _run_dev_mode(self, event: AstrMessageEvent) -> str | None:
         """Enter session-control waiting mode and handle natural language messages."""
@@ -776,14 +669,6 @@ class SelfCodePlugin(Star):
         if value is None:
             return default
         return str(value).strip()
-
-    def _check_single_user_permission(self, event: AstrMessageEvent) -> str:
-        """Validate single-user restriction for command/tool entrypoints."""
-        allowed_user_id = self._cfg_str("single_user_id", "")
-        user_id = event.get_sender_id()
-        if allowed_user_id and user_id != allowed_user_id:
-            return "你没有权限使用该开发插件。"
-        return ""
 
     def _cfg_bool(self, key: str, default: bool) -> bool:
         """Read bool config with permissive normalization."""
