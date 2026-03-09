@@ -7,12 +7,14 @@ import json
 import threading
 from dataclasses import dataclass, field
 from pathlib import Path
+import re
 from uuid import uuid4
 
 from astrbot.api import logger
 from astrbot.api.star import Context
 
 from .codex_runner import run_codex
+from .local_skills import LocalSkillsManager, SkillPlan, SkillSuggestion
 from .prompt_builder import build_prompt
 from .tester import Tester
 from .utils import get_runtime_root
@@ -249,6 +251,9 @@ class DevSession:
     workspace_path: str
     active: bool = True
     history: list[dict[str, str]] = field(default_factory=list)
+    pending_skill_suggestion: SkillSuggestion | None = None
+    pending_skill_intake: bool = False
+    pending_skill_plan: SkillPlan | None = None
 
     def __post_init__(self) -> None:
         """Normalize workspace path after dataclass initialization."""
@@ -259,6 +264,7 @@ class DevSession:
         message: str,
         workspace_manager: WorkspaceManager,
         tester: Tester,
+        local_skills_manager: LocalSkillsManager,
         context: Context,
         codex_timeout: int,
         auto_test_before_apply: bool,
@@ -320,6 +326,40 @@ class DevSession:
                 workspace_manager=workspace_manager,
                 auto_test=auto_test_before_apply,
             )
+        if self._is_log_inspection_intent(text):
+            logger.info("Detected log inspection intent: plugin=%s", self.plugin_name)
+            return await self._run_log_inspection_pipeline(
+                message=text,
+                workspace_manager=workspace_manager,
+                codex_timeout=codex_timeout,
+                codex_bin=codex_bin,
+            )
+        if self._is_autofix_intent(text):
+            logger.info("Detected autofix intent: plugin=%s", self.plugin_name)
+            return await self._run_autofix_pipeline(
+                message=text,
+                workspace_manager=workspace_manager,
+                tester=tester,
+                context=context,
+                codex_timeout=codex_timeout,
+                codex_bin=codex_bin,
+            )
+        if self._is_skill_create_intent(text):
+            return self._start_skill_intake()
+        if self.pending_skill_intake:
+            return self._build_skill_plan_from_intake(
+                text=text,
+                local_skills_manager=local_skills_manager,
+            )
+        if self._is_skill_confirm_intent(text):
+            return await self._handle_skill_confirm(
+                text=text,
+                workspace_manager=workspace_manager,
+                local_skills_manager=local_skills_manager,
+                context=context,
+                codex_timeout=codex_timeout,
+                codex_bin=codex_bin,
+            )
 
         project_tree = (
             "\n".join(workspace_manager.list_files(self.plugin_name)) or "(empty)"
@@ -329,6 +369,7 @@ class DevSession:
             history=self.history,
             user_message=text,
             project_tree=project_tree,
+            plugin_root=workspace_manager.plugin_root,
         )
         self.history.append({"role": "user", "content": text})
         logger.info(
@@ -347,6 +388,13 @@ class DevSession:
             reply = result["stdout"].strip() or "Codex execution completed."
             self.history.append({"role": "assistant", "content": reply})
             logger.info("Codex execution succeeded: plugin=%s", self.plugin_name)
+            suggestion = self._detect_skill_opportunity(text)
+            if suggestion is not None:
+                self.pending_skill_suggestion = suggestion
+                return (
+                    f"{reply}\n\n"
+                    f"{local_skills_manager.render_suggestion_card(suggestion)}"
+                )
             return reply
 
         error = (
@@ -436,10 +484,19 @@ class DevSession:
 
     def _is_test_intent(self, text: str) -> bool:
         """Return whether user asks to run tests."""
-        lowered = text.lower()
-        return any(
-            keyword in lowered for keyword in ("test", "run test", "运行测试", "测试")
-        )
+        lowered = text.lower().strip()
+        exact_tokens = {
+            "test",
+            "run test",
+            "测试",
+            "运行测试",
+            "执行测试",
+            "跑测试",
+            "测一下",
+        }
+        if lowered in exact_tokens:
+            return True
+        return lowered.startswith("test ") or lowered.startswith("run test ")
 
     def _is_apply_intent(self, text: str) -> bool:
         """Return whether user asks to deploy/apply plugin."""
@@ -447,6 +504,46 @@ class DevSession:
         return any(
             keyword in lowered for keyword in ("apply", "deploy", "安装插件", "部署")
         )
+
+    def _is_autofix_intent(self, text: str) -> bool:
+        """Return whether user asks for log-based plugin diagnosis and autofix."""
+        lowered = text.lower()
+        keywords = (
+            "自动修复",
+            "自己修复",
+            "根据日志修复",
+            "看哪个插件",
+            "检查哪个插件",
+            "autofix",
+            "fix from logs",
+        )
+        return any(keyword in lowered for keyword in keywords)
+
+    def _is_log_inspection_intent(self, text: str) -> bool:
+        """Return whether user requests log inspection without direct fixing."""
+        lowered = text.lower()
+        keywords = (
+            "检查日志",
+            "检查一下日志",
+            "看日志",
+            "看看日志",
+            "查看日志",
+            "分析日志",
+            "看报错",
+            "有没有报错",
+            "报错日志",
+            "错误日志",
+            "log check",
+            "check logs",
+        )
+        if any(keyword in lowered for keyword in keywords):
+            # Explicit repair wording should go to autofix path instead.
+            if self._is_autofix_intent(text):
+                return False
+            if "修复" in text or "fix" in lowered:
+                return False
+            return True
+        return False
 
     def _extract_file_path(self, text: str) -> str | None:
         """Extract probable file path from natural-language request."""
@@ -458,6 +555,351 @@ class DevSession:
             if stripped.startswith(prefix):
                 return stripped[len(prefix) :].strip()
         return None
+
+    def _is_skill_confirm_intent(self, text: str) -> bool:
+        """Return whether user confirms creating a suggested skill."""
+        normalized = text.strip().lower()
+        return normalized.startswith("确认创建 skill ") or normalized.startswith(
+            "confirm create skill "
+        )
+
+    def _is_skill_create_intent(self, text: str) -> bool:
+        """Return whether user asks to create a new skill without details."""
+        normalized = text.strip().lower()
+        intents = (
+            "添加一个新的skill",
+            "新增skill",
+            "创建skill",
+            "create a new skill",
+            "add a new skill",
+        )
+        return any(item in normalized for item in intents)
+
+    def _start_skill_intake(self) -> str:
+        """Enter skill-intake state and ask for missing functional details."""
+        self.pending_skill_intake = True
+        self.pending_skill_plan = None
+        self.pending_skill_suggestion = None
+        return (
+            "你要新增 skill，但我还缺少功能描述。\n"
+            "请告诉我这个 skill 具体做什么（输入、步骤、期望输出）。\n"
+            "我会先给出计划，等你确认后再创建并自动重载。"
+        )
+
+    def _build_skill_plan_from_intake(
+        self,
+        text: str,
+        local_skills_manager: LocalSkillsManager,
+    ) -> str:
+        """Create pending skill plan from user-provided feature description."""
+        detail = text.strip()
+        if len(detail) < 4:
+            return "功能描述太短，请再具体一些（例如：处理对象、关键步骤、输出格式）。"
+        suggested_name = self._suggest_skill_name_from_text(detail)
+        plan = local_skills_manager.build_plan_from_requirement(
+            skill_name=suggested_name,
+            requirement=detail,
+        )
+        self.pending_skill_intake = False
+        self.pending_skill_plan = plan
+        return (
+            local_skills_manager.render_plan_card(plan)
+            + "\n\n提示：日志检查默认只分析不修复。"
+        )
+
+    async def _handle_skill_confirm(
+        self,
+        text: str,
+        workspace_manager: WorkspaceManager,
+        local_skills_manager: LocalSkillsManager,
+        context: Context,
+        codex_timeout: int,
+        codex_bin: str,
+    ) -> str:
+        """Create/update local skill after explicit user confirmation."""
+        plan_name = self.pending_skill_plan["skill_name"] if self.pending_skill_plan else ""
+        suggestion_name = (
+            self.pending_skill_suggestion["skill_name"]
+            if self.pending_skill_suggestion
+            else ""
+        )
+        active_name = plan_name or suggestion_name
+        if not active_name:
+            return "当前没有待确认的 skill 建议。"
+        requested_name = self._extract_confirm_skill_name(text)
+        if requested_name and requested_name != active_name:
+            return (
+                "待确认 skill 名称不匹配。\n"
+                f"建议名称: {active_name}\n"
+                f"确认示例: 确认创建 skill {active_name}"
+            )
+
+        if self.pending_skill_plan is not None:
+            skill_name = self.pending_skill_plan["skill_name"]
+            requirement = self.pending_skill_plan["purpose"]
+        elif self.pending_skill_suggestion is not None:
+            skill_name = self.pending_skill_suggestion["skill_name"]
+            requirement = self.pending_skill_suggestion["description"]
+        else:
+            return "当前没有待确认的 skill 建议。"
+        draft = await self._draft_skill_content_with_codex(
+            skill_name=skill_name,
+            requirement=requirement,
+            workspace_manager=workspace_manager,
+            codex_timeout=codex_timeout,
+            codex_bin=codex_bin,
+        )
+        result = local_skills_manager.create_or_update_skill(
+            skill_name=skill_name,
+            requirement=requirement,
+            draft_content=draft,
+        )
+        self.pending_skill_suggestion = None
+        self.pending_skill_plan = None
+        self.pending_skill_intake = False
+        if not result["success"]:
+            return f"Skill 创建失败：{result['message']}"
+        reload_text = await self._reload_self_plugin(context)
+        return (
+            f"{result['message']}\n"
+            f"路径: {result['skill_path']}\n"
+            f"{reload_text}"
+        )
+
+    def _extract_confirm_skill_name(self, text: str) -> str:
+        normalized = text.strip().lower()
+        if normalized.startswith("确认创建 skill "):
+            return normalized[len("确认创建 skill ") :].strip()
+        if normalized.startswith("confirm create skill "):
+            return normalized[len("confirm create skill ") :].strip()
+        return ""
+
+    def _detect_skill_opportunity(self, text: str) -> SkillSuggestion | None:
+        """Heuristic detector for repeatable workflow that should become a skill."""
+        normalized = text.lower()
+        keywords = (
+            "每次",
+            "经常",
+            "重复",
+            "固定流程",
+            "日志排查",
+            "自动修复",
+            "模板化",
+            "workflow",
+            "repeat",
+            "playbook",
+        )
+        if not any(keyword in normalized for keyword in keywords):
+            return None
+        # Suggest one concrete skill derived from current message.
+        skill_name = self._suggest_skill_name_from_text(text)
+        return {
+            "skill_name": skill_name,
+            "description": text.strip()[:140] or "reusable workflow",
+            "trigger_examples": [
+                text.strip()[:80] or f"使用 {skill_name} 处理该任务",
+                f"请用 {skill_name} 流程执行",
+                f"把这类问题沉淀成 {skill_name}",
+            ],
+            "scope": "current_session_only",
+            "benefit": "减少重复提示词，固化高频任务步骤",
+            "draft_summary": "Purpose + Trigger examples + Workflow + Constraints + Output requirements",
+        }
+
+    def _suggest_skill_name_from_text(self, text: str) -> str:
+        lowered = text.lower()
+        if "日志" in text or "log" in lowered:
+            return "log-diagnosis"
+        if "修复" in text or "fix" in lowered:
+            return "plugin-autofix"
+        tokens = [item for item in re.findall(r"[a-z0-9]+", lowered) if len(item) > 2]
+        name = "-".join(tokens[:4]) or "generated-skill"
+        name = re.sub(r"[^a-z0-9-]+", "-", name).strip("-")
+        name = re.sub(r"-{2,}", "-", name)[:64].strip("-")
+        return name or "generated-skill"
+
+    async def _draft_skill_content_with_codex(
+        self,
+        skill_name: str,
+        requirement: str,
+        workspace_manager: WorkspaceManager,
+        codex_timeout: int,
+        codex_bin: str,
+    ) -> str:
+        """Best-effort draft generation for SKILL.md body via Codex CLI."""
+        safe_workspace, error = self._get_safe_workspace_path(workspace_manager)
+        if safe_workspace is None:
+            logger.warning("Skip codex draft due to invalid workspace: %s", error)
+            return ""
+        prompt = (
+            "Write a concise SKILL.md content with YAML frontmatter.\n"
+            f"name: {skill_name}\n"
+            f"description: Local skill for {requirement}\n"
+            "Must include sections: Purpose, Trigger examples, Workflow, Constraints, Output requirements.\n"
+            "Output markdown only."
+        )
+        result = await asyncio.to_thread(
+            run_codex,
+            prompt=prompt,
+            workspace_path=safe_workspace,
+            timeout=min(180, codex_timeout),
+            codex_bin=codex_bin,
+        )
+        if result["exit_code"] != 0:
+            return ""
+        return result["stdout"].strip()
+
+    async def _run_autofix_pipeline(
+        self,
+        message: str,
+        workspace_manager: WorkspaceManager,
+        tester: Tester,
+        context: Context,
+        codex_timeout: int,
+        codex_bin: str,
+    ) -> str:
+        """Run codex-driven autofix, then test and apply on success."""
+        safe_workspace, error = self._get_safe_workspace_path(workspace_manager)
+        if safe_workspace is None:
+            return f"Autofix failed: invalid workspace ({error})"
+
+        project_tree = "\n".join(workspace_manager.list_files(self.plugin_name)) or "(empty)"
+        decision_protocol = (
+            "Autofix protocol:\n"
+            "1) Read logs from `data/logs/astrbot.log` and `data/logs/astrbot.trace.log` first.\n"
+            "2) Identify likely plugin/module owner of the error.\n"
+            f"3) Current session plugin is `{self.plugin_name}`.\n"
+            "4) If owner is not current session plugin, DO NOT modify files. "
+            "Return first line exactly: `AUTOFIX_DECISION: mismatch`.\n"
+            "5) If logs are insufficient, DO NOT modify files. "
+            "Return first line exactly: `AUTOFIX_DECISION: insufficient`.\n"
+            "6) If owner matches current session plugin, perform minimal fix in workspace and "
+            "return first line exactly: `AUTOFIX_DECISION: proceed`.\n"
+            "7) Always include a short evidence summary.\n"
+        )
+        prompt = build_prompt(
+            goal=f"Diagnose and autofix plugin `{self.plugin_name}` from logs",
+            history=self.history,
+            user_message=f"{message}\n\n{decision_protocol}",
+            project_tree=project_tree,
+            plugin_root=workspace_manager.plugin_root,
+        )
+        self.history.append({"role": "user", "content": f"[autofix] {message}"})
+        result = await asyncio.to_thread(
+            run_codex,
+            prompt=prompt,
+            workspace_path=safe_workspace,
+            timeout=codex_timeout,
+            codex_bin=codex_bin,
+        )
+        if result["exit_code"] != 0:
+            error_text = (
+                result["stderr"].strip()
+                or f"Codex failed with exit code {result['exit_code']}"
+            )
+            self.history.append({"role": "assistant", "content": f"ERROR: {error_text}"})
+            return f"Autofix stage failed: {error_text}"
+
+        reply = result["stdout"].strip() or "Codex execution completed."
+        self.history.append({"role": "assistant", "content": reply})
+        decision = self._extract_autofix_decision(reply)
+        if decision == "mismatch":
+            return (
+                "日志归因结果：问题不属于当前会话插件，已拒绝跨插件写入。\n\n"
+                f"{reply}"
+            )
+        if decision == "insufficient":
+            return f"日志线索不足，未执行修改。\n\n{reply}"
+
+        test_result = tester.run(self.plugin_name)
+        if not test_result["success"]:
+            return (
+                "Autofix completed, but test failed. Apply aborted.\n"
+                f"Test error: {test_result['error_message']}\n\n"
+                f"{reply}"
+            )
+        apply_result = await self._apply(
+            context=context,
+            tester=tester,
+            workspace_manager=workspace_manager,
+            auto_test=False,
+        )
+        if "Applied" not in apply_result and "reloaded" not in apply_result:
+            return f"Autofix test passed, but apply failed: {apply_result}\n\n{reply}"
+        return f"Autofix completed, test passed, and apply succeeded.\n\n{apply_result}\n\n{reply}"
+
+    async def _run_log_inspection_pipeline(
+        self,
+        message: str,
+        workspace_manager: WorkspaceManager,
+        codex_timeout: int,
+        codex_bin: str,
+    ) -> str:
+        """Run log-only diagnosis workflow without code modification."""
+        safe_workspace, error = self._get_safe_workspace_path(workspace_manager)
+        if safe_workspace is None:
+            return f"Log inspection failed: invalid workspace ({error})"
+        project_tree = "\n".join(workspace_manager.list_files(self.plugin_name)) or "(empty)"
+        protocol = (
+            "Log inspection protocol (read-only):\n"
+            "1) Inspect `data/logs/astrbot.log` and `data/logs/astrbot.trace.log`.\n"
+            "2) Report findings: diagnosis, evidence, risks, and suggestions.\n"
+            "3) Do NOT modify code or files.\n"
+            "4) End with: `NEXT_ACTION: ask_user_decision`.\n"
+        )
+        prompt = build_prompt(
+            goal=f"Inspect logs for plugin `{self.plugin_name}` without code changes",
+            history=self.history,
+            user_message=f"{message}\n\n{protocol}",
+            project_tree=project_tree,
+            plugin_root=workspace_manager.plugin_root,
+        )
+        result = await asyncio.to_thread(
+            run_codex,
+            prompt=prompt,
+            workspace_path=safe_workspace,
+            timeout=min(180, codex_timeout),
+            codex_bin=codex_bin,
+        )
+        if result["exit_code"] != 0:
+            error_text = (
+                result["stderr"].strip()
+                or f"Codex failed with exit code {result['exit_code']}"
+            )
+            return f"日志检查失败：{error_text}"
+        reply = result["stdout"].strip() or "日志检查完成，但没有返回内容。"
+        self.history.append({"role": "assistant", "content": reply})
+        return (
+            f"{reply}\n\n"
+            "请你决定下一步：修复 / 增强 / 继续观察。"
+        )
+
+    async def _reload_self_plugin(self, context: Context) -> str:
+        """Reload this plugin after local skill creation."""
+        manager = getattr(context, "_star_manager", None)
+        if manager is None or not hasattr(manager, "reload"):
+            return "Skill 已写入并生效；插件重载跳过（无可用 reload 接口）。"
+        try:
+            reload_result = manager.reload("astrbot_plugin_self_code")
+            if hasattr(reload_result, "__await__"):
+                await reload_result
+            return "Skill 已写入并生效，已自动重载 `astrbot_plugin_self_code`。"
+        except Exception as exc:  # pragma: no cover - runtime defensive path.
+            logger.exception("Self plugin reload failed: %s", exc)
+            return f"Skill 已写入并生效，但自动重载失败：{exc}"
+
+    def _extract_autofix_decision(self, reply: str) -> str:
+        """Parse autofix decision marker from codex output."""
+        for line in reply.splitlines():
+            normalized = line.strip().lower()
+            if normalized == "autofix_decision: mismatch":
+                return "mismatch"
+            if normalized == "autofix_decision: insufficient":
+                return "insufficient"
+            if normalized == "autofix_decision: proceed":
+                return "proceed"
+        # If marker missing, use safe fallback.
+        return "insufficient"
 
     def _get_safe_workspace_path(
         self,

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -10,7 +11,10 @@ from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.api.util import SessionController, session_waiter
 
+from .core.codex_runner import run_codex
 from .core.dev_session import DevSession
+from .core.local_skills import LocalSkillsManager
+from .core.skills_cache import SkillsCacheManager
 from .core.tester import Tester
 from .core.utils import validate_plugin_name
 from .core.workspace import WorkspaceManager
@@ -23,7 +27,7 @@ COMMAND_PREFIX = f"/{COMMAND_NAME}"
     "astrbot_plugin_self_code",
     "YakumoAki",
     "AI coding assistant plugin for AstrBot.",
-    "0.2.0",
+    "0.3.0",
 )
 class SelfCodePlugin(Star):
     """Provide V1 commands and V2 Dev Session Mode for coding workflows."""
@@ -35,6 +39,8 @@ class SelfCodePlugin(Star):
         self.plugin_root = Path(__file__).resolve().parent
         self.workspace_manager = WorkspaceManager(self.plugin_root)
         self.tester = Tester(self.plugin_root, context=self.context)
+        self.skills_cache = SkillsCacheManager(self.plugin_root)
+        self.local_skills = LocalSkillsManager(self.plugin_root)
         self.dev_session: DevSession | None = None
         self.last_plugin_name: str | None = None
         self.pending_stop_confirm_until: float | None = None
@@ -42,7 +48,17 @@ class SelfCodePlugin(Star):
     async def initialize(self) -> None:
         """Prepare runtime directories during plugin startup."""
         self.workspace_manager.ensure_runtime_structure()
+        self.skills_cache.ensure_structure()
+        self.local_skills.ensure_structure()
         logger.info("astrbot_plugin_self_code runtime directories are ready.")
+
+    async def terminate(self) -> None:
+        """Best-effort cleanup when plugin unloads."""
+        if self.dev_session:
+            self.dev_session.active = False
+        self.dev_session = None
+        self.pending_stop_confirm_until = None
+        logger.info("astrbot_plugin_self_code terminated and in-memory state cleared.")
 
     @filter.command(COMMAND_NAME)
     async def dev(self, event: AstrMessageEvent):
@@ -80,7 +96,8 @@ class SelfCodePlugin(Star):
                 self._append_command_hint(
                     f"用法：{COMMAND_PREFIX} start <plugin_name> | {COMMAND_PREFIX} resume <plugin_name> | "
                     f"{COMMAND_PREFIX} ask <需求> | {COMMAND_PREFIX} files | {COMMAND_PREFIX} cat <文件> | "
-                    f"{COMMAND_PREFIX} test | {COMMAND_PREFIX} apply | {COMMAND_PREFIX} stop | {COMMAND_PREFIX} status"
+                    f"{COMMAND_PREFIX} test | {COMMAND_PREFIX} apply | {COMMAND_PREFIX} stop | {COMMAND_PREFIX} status | "
+                    f"{COMMAND_PREFIX} skills <update|status|suggest|create|list|show>"
                 )
             )
             return
@@ -186,7 +203,11 @@ class SelfCodePlugin(Star):
                 self.dev_session.active = False
             logger.info("Dev mode timeout reached")
             self._terminate_dev_session()
-            return "开发模式等待超时（10分钟），会话已退出。可使用 /codexdev resume <plugin_name> 继续。"
+            timeout_minutes = max(1, round(timeout_seconds / 60))
+            return (
+                f"开发模式等待超时（约{timeout_minutes}分钟），会话已退出。"
+                f"可使用 {COMMAND_PREFIX} resume <plugin_name> 继续。"
+            )
         except Exception as exc:  # pragma: no cover - runtime defensive path.
             logger.exception("Dev mode waiter failed: %s", exc)
             if self.dev_session:
@@ -251,6 +272,7 @@ class SelfCodePlugin(Star):
                 message=raw_message,
                 workspace_manager=self.workspace_manager,
                 tester=self.tester,
+                local_skills_manager=self.local_skills,
                 context=self.context,
                 codex_timeout=self._cfg_int(
                     "codex_timeout", 300, minimum=10, maximum=3600
@@ -271,6 +293,50 @@ class SelfCodePlugin(Star):
 
         if command == "status":
             return self._status_text()
+        if command == "skills" or command == "skill":
+            sub_tokens = argument.split() if argument else []
+            subcommand = sub_tokens[0].strip().lower() if sub_tokens else ""
+            if subcommand == "update":
+                result = await asyncio.to_thread(self.skills_cache.update_from_remote)
+                status_text = self.skills_cache.render_status_text()
+                if result.get("success"):
+                    return f"{result.get('message', 'Skills cache updated.')}\n\n{status_text}"
+                return f"{result.get('message', 'Skills cache update failed.')}\n\n{status_text}"
+            if subcommand == "status":
+                return self.skills_cache.render_status_text()
+            if subcommand == "list":
+                names = self.local_skills.list_skills()
+                if not names:
+                    return "暂无本地 skills。"
+                return "本地 skills:\n" + "\n".join(f"- {item}" for item in names)
+            if subcommand == "show":
+                if len(sub_tokens) < 2:
+                    return f"用法：{COMMAND_PREFIX} skills show <skill_name>"
+                skill_name = sub_tokens[1].strip()
+                try:
+                    content = self.local_skills.show_skill(skill_name)
+                except Exception as exc:
+                    return f"读取 skill 失败：{exc}"
+                preview = "\n".join(content.splitlines()[:80])
+                return f"`{skill_name}`:\n{preview}"
+            if subcommand == "suggest":
+                requirement = " ".join(sub_tokens[1:]).strip()
+                if not requirement:
+                    return f"用法：{COMMAND_PREFIX} skills suggest <需求>"
+                suggestion = await self._suggest_skill(requirement)
+                if self.dev_session and self.dev_session.active:
+                    self.dev_session.pending_skill_suggestion = suggestion
+                return self.local_skills.render_suggestion_card(suggestion)
+            if subcommand == "create":
+                if len(sub_tokens) < 3:
+                    return (
+                        f"用法：{COMMAND_PREFIX} skills create <skill_name> <需求>\n"
+                        f"或在会话中发送：确认创建 skill <skill_name>"
+                    )
+                skill_name = sub_tokens[1].strip()
+                requirement = " ".join(sub_tokens[2:]).strip()
+                return await self._create_skill(skill_name=skill_name, requirement=requirement)
+            return f"用法：{COMMAND_PREFIX} skills <update|status|suggest|create|list|show>"
         if command == "stop":
             if self.dev_session and self.dev_session.active:
                 if self._should_confirm_stop(argument):
@@ -296,6 +362,7 @@ class SelfCodePlugin(Star):
                 message=argument,
                 workspace_manager=self.workspace_manager,
                 tester=self.tester,
+                local_skills_manager=self.local_skills,
                 context=self.context,
                 codex_timeout=self._cfg_int(
                     "codex_timeout", 300, minimum=10, maximum=3600
@@ -354,6 +421,7 @@ class SelfCodePlugin(Star):
                 message="部署",
                 workspace_manager=self.workspace_manager,
                 tester=self.tester,
+                local_skills_manager=self.local_skills,
                 context=self.context,
                 codex_timeout=self._cfg_int(
                     "codex_timeout", 300, minimum=10, maximum=3600
@@ -369,6 +437,7 @@ class SelfCodePlugin(Star):
                 message=merged,
                 workspace_manager=self.workspace_manager,
                 tester=self.tester,
+                local_skills_manager=self.local_skills,
                 context=self.context,
                 codex_timeout=self._cfg_int(
                     "codex_timeout", 300, minimum=10, maximum=3600
@@ -515,6 +584,77 @@ class SelfCodePlugin(Star):
         }
         return normalized in intents
 
+    async def _suggest_skill(self, requirement: str) -> dict[str, object]:
+        """Generate one skill suggestion with Codex best-effort fallback."""
+        heuristic = self.local_skills.propose_from_text(requirement)
+        workspace = self.plugin_root
+        if self.dev_session and self.dev_session.active:
+            workspace = self.workspace_manager.get_workspace(self.dev_session.plugin_name)
+
+        prompt = (
+            "Return JSON only with keys: skill_name, description, trigger_examples, scope, benefit, draft_summary.\n"
+            "Constraints: scope must be current_session_only; concise and reusable.\n"
+            f"Requirement: {requirement}"
+        )
+        result = await asyncio.to_thread(
+            run_codex,
+            prompt=prompt,
+            workspace_path=workspace,
+            timeout=min(120, self._cfg_int("codex_timeout", 300, minimum=10, maximum=3600)),
+        )
+        if result["exit_code"] == 0:
+            parsed = self.local_skills.try_parse_json_suggestion(result["stdout"])
+            if parsed is not None:
+                return parsed
+        return heuristic
+
+    async def _create_skill(self, skill_name: str, requirement: str) -> str:
+        """Create or update local skill, backing up old content on duplicate."""
+        workspace = self.plugin_root
+        if self.dev_session and self.dev_session.active:
+            workspace = self.workspace_manager.get_workspace(self.dev_session.plugin_name)
+        prompt = (
+            "Write SKILL.md markdown with YAML frontmatter (name, description). "
+            "Sections required: Purpose, Trigger examples, Workflow, Constraints, Output requirements.\n"
+            f"skill_name={skill_name}\n"
+            f"requirement={requirement}\n"
+            "Output markdown only."
+        )
+        result = await asyncio.to_thread(
+            run_codex,
+            prompt=prompt,
+            workspace_path=workspace,
+            timeout=min(180, self._cfg_int("codex_timeout", 300, minimum=10, maximum=3600)),
+        )
+        draft = result["stdout"].strip() if result["exit_code"] == 0 else ""
+        write_result = self.local_skills.create_or_update_skill(
+            skill_name=skill_name,
+            requirement=requirement,
+            draft_content=draft,
+        )
+        if not write_result["success"]:
+            return f"Skill 创建失败：{write_result['message']}"
+        reload_text = await self._reload_self_plugin()
+        return (
+            f"{write_result['message']}\n"
+            f"路径: {write_result['skill_path']}\n"
+            f"{reload_text}"
+        )
+
+    async def _reload_self_plugin(self) -> str:
+        """Reload this plugin after local skill creation/update."""
+        manager = getattr(self.context, "_star_manager", None)
+        if manager is None or not hasattr(manager, "reload"):
+            return "Skill 已写入并生效；插件重载跳过（无可用 reload 接口）。"
+        try:
+            reload_result = manager.reload("astrbot_plugin_self_code")
+            if hasattr(reload_result, "__await__"):
+                await reload_result
+            return "Skill 已写入并生效，已自动重载 `astrbot_plugin_self_code`。"
+        except Exception as exc:  # pragma: no cover - runtime defensive path.
+            logger.exception("Self plugin reload failed: %s", exc)
+            return f"Skill 已写入并生效，但自动重载失败：{exc}"
+
     def _cfg_str(self, key: str, default: str) -> str:
         """Read string config with safe fallback."""
         value = self.config.get(key, default)
@@ -544,11 +684,15 @@ class SelfCodePlugin(Star):
         """Append concise command hints to response text."""
         hint = (
             f"命令提示：{COMMAND_PREFIX} status | {COMMAND_PREFIX} files | "
-            f"{COMMAND_PREFIX} test | {COMMAND_PREFIX} apply | {COMMAND_PREFIX} stop"
+            f"{COMMAND_PREFIX} test | {COMMAND_PREFIX} apply | {COMMAND_PREFIX} stop | "
+            f"{COMMAND_PREFIX} skills status | {COMMAND_PREFIX} skills suggest <需求>\n"
+            "引导：日志检查默认只分析不修复；skill 创建需先确认计划。"
             if in_dev_mode
             else (
                 f"命令提示：{COMMAND_PREFIX} start <plugin_name> | "
-                f"{COMMAND_PREFIX} resume <plugin_name> | {COMMAND_PREFIX} status"
+                f"{COMMAND_PREFIX} resume <plugin_name> | {COMMAND_PREFIX} status | "
+                f"{COMMAND_PREFIX} skills status | {COMMAND_PREFIX} skills list\n"
+                "引导：日志检查默认只分析不修复；skill 创建需先确认计划。"
             )
         )
         if hint in message:

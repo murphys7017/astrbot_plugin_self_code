@@ -22,5 +22,35 @@
     "description": "Dev Mode Timeout Seconds",
     "hint": "How long session mode waits for next message before auto-stop.",
     "default": 1800
+  },
+  "skills_update_hint": {
+    "type": "string",
+    "description": "Skills Update Mode (Hint)",
+    "hint": "AstrBot-Skill 缓存为手动更新；请使用 /codexdev skills update。",
+    "default": "manual"
+  },
+  "autofix_scope_hint": {
+    "type": "string",
+    "description": "Autofix Scope (Hint)",
+    "hint": "自动修复仅允许修改当前开发会话插件；不会跨插件写入。",
+    "default": "current_session_only"
+  },
+  "self_authoring_skill_hint": {
+    "type": "string",
+    "description": "Self Authoring Skill (Hint)",
+    "hint": "支持自动建议技能并在确认后创建/更新本地 skill。",
+    "default": "enabled_with_confirm"
+  },
+  "log_inspection_mode_hint": {
+    "type": "string",
+    "description": "Log Inspection Mode (Hint)",
+    "hint": "日志检查默认只读分析并返回结论，不直接触发修复。",
+    "default": "analyze_only"
+  },
+  "skill_creation_flow_hint": {
+    "type": "string",
+    "description": "Skill Creation Flow (Hint)",
+    "hint": "新增 skill 流程：先收集功能 -> 输出计划 -> 确认创建 -> 自动重载本插件。",
+    "default": "plan_then_confirm_then_reload"
   }
 }

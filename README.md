@@ -10,6 +10,11 @@
 - Workspace 文件管理（读/写/列表）
 - Sandbox 基础测试（`main.py`、`metadata.yaml`、导入/重载）
 - 一键部署到 AstrBot 插件目录
+- AstrBot-Skill 手动缓存更新（用于增强提示词参考）
+- 本地可注册技能（`data/local_skills/**/SKILL.md`），可定义日志检查等固定流程
+- 日志归因自动修复（仅当前会话插件；测试通过后自动 apply）
+- 支持 AI 自动建议并创建本地 skill（确认后即时生效）
+- 提示词自动拼接：本地 skills 摘要 + AstrBot-Skill 缓存摘要
 
 ## 项目结构
 
@@ -22,10 +27,17 @@ astrbot_plugin_self_code/
 ├── core/
 │   ├── codex_runner.py
 │   ├── dev_session.py
+│   ├── local_skills.py
 │   ├── prompt_builder.py
+│   ├── skills_cache.py
 │   ├── tester.py
 │   ├── utils.py
 │   └── workspace.py
+├── data/
+│   └── local_skills/
+│       └── log_inspection/SKILL.md
+│       └── plugin_autofix/SKILL.md
+│       └── <generated-skill>/SKILL.md
 └── astrbot_dev_docs.md
 ```
 
@@ -34,6 +46,7 @@ astrbot_plugin_self_code/
 ```text
 AstrBot/data/plugin_data/astrbot_plugin_self_code/runtime/
 ├── sessions.json
+├── skills_cache/
 ├── sandbox_plugins/
 └── workspaces/
 ```
@@ -53,6 +66,18 @@ AstrBot/data/plugin_data/astrbot_plugin_self_code/runtime/
   - 发起退出开发模式（需要确认）
 - `/codexdev stop confirm`
   - 确认退出开发模式
+- `/codexdev skills update`
+  - 手动刷新 AstrBot-Skill 本地缓存快照
+- `/codexdev skills status`
+  - 查看缓存状态（更新时间、文件数、来源分支、最近错误）
+- `/codexdev skills suggest <需求>`
+  - 生成本地 skill 建议卡（名称、触发语句、收益）
+- `/codexdev skills create <skill_name> <需求>`
+  - 创建或更新本地 skill（同名先备份再更新）
+- `/codexdev skills list`
+  - 列出本地 skill 名称
+- `/codexdev skills show <skill_name>`
+  - 查看本地 skill 内容预览
 
 V1 兼容命令（在会话中或显式调用）：
 
@@ -61,6 +86,29 @@ V1 兼容命令（在会话中或显式调用）：
 - `/codexdev cat <file>`
 - `/codexdev test`
 - `/codexdev apply`
+
+自动修复示例（自然语言触发）：
+- `自己看是哪个插件并修复`
+- `根据日志自动修复`
+
+日志检查示例（默认只分析不修复）：
+- `检查一下日志`
+- `看日志`
+
+新建 skill 对话示例：
+- `添加一个新的skill`
+- （机器人追问功能描述）
+- `用于分析支付失败日志并输出分级建议`
+- （机器人给出计划卡）
+- `确认创建 skill payment-log-triage`
+
+Skill 建议与确认示例：
+- `这个流程我经常重复，帮我沉淀成 skill`
+- `确认创建 skill log-diagnosis`
+
+说明：
+- `skills create` 会在同名 skill 已存在时自动备份到 `data/local_skills/_backup/`
+- 会话内通过“确认创建 skill <name>”创建成功后，会尝试自动重载 `astrbot_plugin_self_code`
 
 兼容别名：
 
@@ -106,12 +154,13 @@ V1 兼容命令（在会话中或显式调用）：
 
 目标目录为：
 
-`/home/aki/AstrBot/data/plugins/<plugin_name>`
+`<AstrBot项目根目录>/data/plugins/<plugin_name>`
 
 说明：
 - 是复制（copy），不是移动（move）
 - 复制前会删除同名旧目录并覆盖
 - 然后尝试调用 AstrBot 的插件重载
+- 该目录由当前插件所在目录自动推导（`plugin_root.parent / <plugin_name>`）
 
 ## 官方开发原则（AstrBot 推荐）
 
@@ -131,6 +180,11 @@ V1 兼容命令（在会话中或显式调用）：
 - `codex_timeout`：`codex exec` 超时秒数（默认 300）
 - `auto_test_before_apply`：部署前自动测试（默认 `true`）
 - `dev_mode_timeout`：Dev Mode 会话等待超时（默认 1800 秒）
+- `skills_update_hint`：提示性配置，说明 skills 为手动更新模式（默认 `manual`）
+- `autofix_scope_hint`：提示性配置，说明自动修复仅作用当前会话插件（默认 `current_session_only`）
+- `self_authoring_skill_hint`：提示性配置，说明支持自动建议+确认创建 skill（默认 `enabled_with_confirm`）
+- `log_inspection_mode_hint`：提示性配置，说明日志检查默认只读分析（默认 `analyze_only`）
+- `skill_creation_flow_hint`：提示性配置，说明 skill 创建流程为“先计划后确认再创建并自动重载”（默认 `plan_then_confirm_then_reload`）
 
 ## plugin_name 规则
 
@@ -188,4 +242,4 @@ uv run ruff check .
 
 ## License
 
-按你的项目策略补充。
+`LICENSE` 文件为 GNU GPL v3.0。

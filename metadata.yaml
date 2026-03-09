@@ -1,6 +1,6 @@
-name: astrbot_plugin_self_code
+﻿name: astrbot_plugin_self_code
 display_name: Self Code Assistant
 desc: 一个用于 AstrBot 的 AI 编程助手插件。它把聊天指令转为 codex CLI 操作，在 workspace 中生成/修改插件代码，并支持测试和部署。
-version: v0.1.0
+version: 0.3.0
 author: YakumoAki
 repo: https://github.com/murphys7017/astrbot_plugin_self_code
